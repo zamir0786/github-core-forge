@@ -235,6 +235,224 @@ func restParseBody(bodyText string) (map[string]any, bool) {
 	return obj, true
 }
 
+func restSkipJSONSpace(s string, i int) int {
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
+		i++
+	}
+	return i
+}
+
+// restPlainJSONStringEnd returns the index after a JSON string with no escape
+// sequences. Escaped strings are deliberately left to the encoding/json fallback.
+func restPlainJSONStringEnd(s string, i int) int {
+	if i >= len(s) || s[i] != '"' {
+		return -1
+	}
+	for j := i + 1; j < len(s); j++ {
+		if s[j] == '\\' {
+			return -1
+		}
+		if s[j] == '"' {
+			return j + 1
+		}
+	}
+	return -1
+}
+
+func restSkipJSONValue(s string, i int) int {
+	i = restSkipJSONSpace(s, i)
+	if i >= len(s) {
+		return -1
+	}
+	switch s[i] {
+	case '"':
+		j := i + 1
+		for j < len(s) {
+			if s[j] == '\\' {
+				j += 2
+				continue
+			}
+			if s[j] == '"' {
+				return j + 1
+			}
+			j++
+		}
+		return -1
+	case '{', '[':
+		var stack [16]byte
+		top := 0
+		inString := false
+		expectValue := false
+		for j := i; j < len(s); j++ {
+			c := s[j]
+			if inString {
+				if c == '\\' {
+					j++
+					continue
+				}
+				if c == '"' {
+					inString = false
+					expectValue = false
+				}
+				continue
+			}
+			switch c {
+			case ' ', '\t', '\r', '\n':
+				continue
+			case '"':
+				inString = true
+				expectValue = false
+			case ',':
+				if expectValue {
+					return -1
+				}
+				expectValue = true
+			case ':':
+				expectValue = true
+			case '{', '[':
+				if top >= len(stack) {
+					return -1
+				}
+				if c == '{' {
+					stack[top] = '}'
+				} else {
+					stack[top] = ']'
+				}
+				top++
+				expectValue = false
+			case '}', ']':
+				if expectValue || top == 0 || stack[top-1] != c {
+					return -1
+				}
+				top--
+				if top == 0 {
+					return j + 1
+				}
+			default:
+				expectValue = false
+			}
+		}
+		return -1
+	case 't':
+		if strings.HasPrefix(s[i:], "true") {
+			return i + 4
+		}
+	case 'f':
+		if strings.HasPrefix(s[i:], "false") {
+			return i + 5
+		}
+	case 'n':
+		if strings.HasPrefix(s[i:], "null") {
+			return i + 4
+		}
+	default:
+		start := i
+		if s[i] == '-' {
+			i++
+		}
+		digits := 0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+			digits++
+		}
+		if digits == 0 {
+			return -1
+		}
+		if i < len(s) && s[i] == '.' {
+			i++
+			frac := 0
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+				frac++
+			}
+			if frac == 0 {
+				return -1
+			}
+		}
+		if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+			i++
+			if i < len(s) && (s[i] == '+' || s[i] == '-') {
+				i++
+			}
+			exp := 0
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+				exp++
+			}
+			if exp == 0 {
+				return -1
+			}
+		}
+		_ = start
+		return i
+	}
+	return -1
+}
+
+// restParseIssueCreateFast handles the benchmark's simple {title, body} JSON
+// without building a map or decoding through encoding/json. Escaped strings,
+// labels, or any unusual shape fall back to restParseBody.
+func restParseIssueCreateFast(text string) (title, body string, ok bool) {
+	s := strings.TrimSpace(text)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return "", "", false
+	}
+	i := 1
+	for {
+		i = restSkipJSONSpace(s, i)
+		if i >= len(s)-1 {
+			break
+		}
+		if s[i] != '"' {
+			return "", "", false
+		}
+		keyEnd := restPlainJSONStringEnd(s, i)
+		if keyEnd < 0 {
+			return "", "", false
+		}
+		key := s[i+1 : keyEnd-1]
+		i = restSkipJSONSpace(s, keyEnd)
+		if i >= len(s) || s[i] != ':' {
+			return "", "", false
+		}
+		i = restSkipJSONSpace(s, i+1)
+		if key == "labels" {
+			return "", "", false
+		}
+		if key == "title" || key == "body" {
+			valueEnd := restPlainJSONStringEnd(s, i)
+			if valueEnd < 0 {
+				return "", "", false
+			}
+			if key == "title" {
+				title = s[i+1 : valueEnd-1]
+			} else {
+				body = s[i+1 : valueEnd-1]
+			}
+			i = valueEnd
+		} else {
+			i = restSkipJSONValue(s, i)
+			if i < 0 {
+				return "", "", false
+			}
+		}
+		i = restSkipJSONSpace(s, i)
+		if i < len(s) && s[i] == ',' {
+			i = restSkipJSONSpace(s, i+1)
+			if i >= len(s)-1 || s[i] == '}' {
+				return "", "", false
+			}
+			continue
+		}
+		break
+	}
+	i = restSkipJSONSpace(s, i)
+	if i != len(s)-1 {
+		return "", "", false
+	}
+	return title, body, true
+}
+
 func restStr(obj map[string]any, key, fallback string) string {
 	if v, ok := obj[key]; ok {
 		if s, ok := v.(string); ok {
@@ -405,6 +623,168 @@ func restIssueString(issue *Issue, repo *Repo) string {
 	return text
 }
 
+const jsonHexDigits = "0123456789abcdef"
+
+// appendJSONString matches encoding/json's default string escaping, including
+// HTML and U+2028/U+2029 escaping, so the hand-rolled create response is
+// byte-identical to the one produced through restJObj.MarshalJSON.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 {
+			if s[i+2] == 0xA8 || s[i+2] == 0xA9 {
+				dst = append(dst, s[start:i]...)
+				if s[i+2] == 0xA8 {
+					dst = append(dst, `\u2028`...)
+				} else {
+					dst = append(dst, `\u2029`...)
+				}
+				i += 2
+				start = i + 1
+				continue
+			}
+		}
+		if c >= 0x20 && c != '"' && c != '\\' && c != '<' && c != '>' && c != '&' {
+			continue
+		}
+		dst = append(dst, s[start:i]...)
+		switch c {
+		case '"':
+			dst = append(dst, `\"`...)
+		case '\\':
+			dst = append(dst, `\\`...)
+		case '\b':
+			dst = append(dst, `\b`...)
+		case '\f':
+			dst = append(dst, `\f`...)
+		case '\n':
+			dst = append(dst, `\n`...)
+		case '\r':
+			dst = append(dst, `\r`...)
+		case '\t':
+			dst = append(dst, `\t`...)
+		case '<':
+			dst = append(dst, `\u003c`...)
+		case '>':
+			dst = append(dst, `\u003e`...)
+		case '&':
+			dst = append(dst, `\u0026`...)
+		default:
+			dst = append(dst, '\\', 'u', '0', '0', jsonHexDigits[c>>4], jsonHexDigits[c&0x0f])
+		}
+		start = i + 1
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+// appendCreateIssueJSON emits exactly restIssueJSONText's bytes for a freshly
+// created open issue: same field order, same null/false values, trailing newline.
+func appendCreateIssueJSON(dst []byte, issue *Issue, repo *Repo) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, int64(issue.ID), 10)
+	dst = append(dst, `,"node_id":"I_`...)
+	dst = strconv.AppendInt(dst, int64(issue.ID), 10)
+	dst = append(dst, `","number":`...)
+	dst = strconv.AppendInt(dst, int64(issue.Number), 10)
+	dst = append(dst, `,"title":`...)
+	dst = appendJSONString(dst, issue.Title)
+	dst = append(dst, `,"body":`...)
+	dst = appendJSONString(dst, issue.Body)
+	dst = append(dst, `,"state":"open","state_reason":null,"locked":false,"labels":[`...)
+	for i, label := range issue.Labels {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, `{"id":`...)
+		dst = strconv.AppendInt(dst, int64(label.ID), 10)
+		dst = append(dst, `,"name":`...)
+		dst = appendJSONString(dst, label.Name)
+		dst = append(dst, `,"color":`...)
+		dst = appendJSONString(dst, label.Color)
+		dst = append(dst, `,"description":`...)
+		dst = appendJSONString(dst, label.Description)
+		dst = append(dst, `,"default":false}`...)
+	}
+	dst = append(dst, `],"user":{"login":`...)
+	dst = appendJSONString(dst, Viewer.Login)
+	dst = append(dst, `,"id":`...)
+	dst = strconv.AppendInt(dst, int64(restUserIDOf(Viewer.Login)), 10)
+	dst = append(dst, `,"type":"User"},"comments":`...)
+	dst = strconv.AppendInt(dst, int64(issue.Comments), 10)
+	dst = append(dst, `,"created_at":`...)
+	dst = appendJSONString(dst, issue.CreatedAt)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, issue.UpdatedAt)
+	dst = append(dst, `,"closed_at":null,"html_url":"http://localhost/`...)
+	dst = append(dst, repo.Owner...)
+	dst = append(dst, '/')
+	dst = append(dst, repo.Name...)
+	dst = append(dst, `/issues/`...)
+	dst = strconv.AppendInt(dst, int64(issue.Number), 10)
+	dst = append(dst, `","url":`...)
+	var urlBuf [256]byte
+	baseURL := append(urlBuf[:0], "/api/v3/repos/"...)
+	baseURL = append(baseURL, repo.Owner...)
+	baseURL = append(baseURL, '/')
+	baseURL = append(baseURL, repo.Name...)
+	issueURL := append(baseURL, "/issues/"...)
+	issueURL = strconv.AppendInt(issueURL, int64(issue.Number), 10)
+	dst = appendJSONString(dst, bytesToString(issueURL))
+	dst = append(dst, `,"repository_url":`...)
+	dst = appendJSONString(dst, bytesToString(baseURL))
+	dst = append(dst, "}\n"...)
+	return dst
+}
+
+// issueCreatePrebuilt serializes the full 201 response in one pass. The write
+// workload never reads this issue back through the cached GET path, so the
+// response is intentionally not stored on the issue.
+func issueCreatePrebuilt(dst []byte, issue *Issue, repo *Repo, host string) []byte {
+	// Build the status line, headers and JSON body into one buffer. The
+	// content-length field is back-patched after the body length is known.
+	if cap(dst) < 1024+len(issue.Title)+len(issue.Body)+32*len(issue.Labels) {
+		grown := make([]byte, 0, 1024+len(issue.Title)+len(issue.Body)+32*len(issue.Labels))
+		dst = grown
+	}
+	dst = append(dst, "HTTP/1.1 201 Created\r\ncontent-type: "...)
+	dst = append(dst, JSONType...)
+	dst = append(dst, "\r\ncontent-length: "...)
+	var lengthPlaceholder [12]byte // up to 10 decimal digits plus CRLF
+	for i := 0; i < 10; i++ {
+		lengthPlaceholder[i] = ' '
+	}
+	lengthPlaceholder[10] = '\r'
+	lengthPlaceholder[11] = '\n'
+	const lengthSlot = len(lengthPlaceholder)
+	lengthStart := len(dst)
+	dst = append(dst, lengthPlaceholder[:]...)
+	dst = append(dst, "location: http://"...)
+	dst = append(dst, host...)
+	dst = append(dst, "/api/v3/repos/"...)
+	dst = append(dst, repo.Owner...)
+	dst = append(dst, '/')
+	dst = append(dst, repo.Name...)
+	dst = append(dst, "/issues/"...)
+	dst = strconv.AppendInt(dst, int64(issue.Number), 10)
+	dst = append(dst, "\r\nx-github-request-id: "...)
+	dst = append(dst, constantRequestID...)
+	dst = append(dst, "\r\n\r\n"...)
+	bodyStart := len(dst)
+	dst = appendCreateIssueJSON(dst, issue, repo)
+	bodyEnd := len(dst)
+
+	var lengthBuf [20]byte
+	length := strconv.AppendInt(lengthBuf[:0], int64(bodyEnd-bodyStart), 10)
+	length = append(length, '\r', '\n')
+	shift := lengthSlot - len(length)
+	copy(dst[lengthStart+len(length):], dst[lengthStart+lengthSlot:bodyEnd])
+	copy(dst[lengthStart:lengthStart+len(length)], length)
+	return dst[:bodyEnd-shift]
+}
+
 func restCommentObj(comment Comment) restJObj {
 	return restObj(
 		"id", comment.ID,
@@ -460,6 +840,39 @@ func restCommitJSON(sha, message string) restJObj {
 // These mirror store.ts exactly; keeping them here avoids dependence on the
 // in-flight store.go helper signatures and preserves deterministic counters.
 
+// invalidateIssue drops both the body string and the pre-rendered full HTTP
+// response. CacheKey is intentionally stable, so no global map sweep is needed.
+func invalidateIssue(issue *Issue) {
+	issue.Cache = ""
+	issue.Full.Store(nil)
+	responseGen.Add(1)
+}
+
+func invalidateRepoIssues(repo *Repo) {
+	for _, issue := range repo.Issues {
+		invalidateIssue(issue)
+	}
+	repo.Rev.Add(1)
+}
+
+// issuePrebuiltResponse returns the complete serialized HTTP response for a
+// single-issue GET. The first request builds it; every later read returns the
+// same immutable bytes with no handler-side headers and no body copy.
+func issuePrebuiltResponse(issue *Issue, repo *Repo) []byte {
+	if built := issue.Full.Load(); built != nil {
+		return *built
+	}
+	text := restIssueString(issue, repo)
+	built := buildResponse(nil, HTTPResult{
+		Status:      200,
+		ContentType: JSONType,
+		Body:        stringToBytes(text),
+		Headers:     restHeaders(),
+	}, false)
+	issue.Full.Store(&built)
+	return built
+}
+
 func restCreateIssue(repo *Repo, title, body string, labels []Label) *Issue {
 	repo.IssueSeq++
 	GlobalStore.IssueIDSeq++
@@ -488,7 +901,7 @@ func restAddComment(repo *Repo, issue *Issue, body string) Comment {
 	repo.Comments[issue.ID] = list
 	issue.Comments = len(list)
 	issue.UpdatedAt = now
-	issue.Cache = ""
+	invalidateIssue(issue)
 	return comment
 }
 
@@ -629,6 +1042,7 @@ func restMergePull(repo *Repo, pull *Pull) restMergeResult {
 	message := "Merge pull request #" + strconv.Itoa(pull.Number) + " from " + pull.HeadRef + "\n\n" + pull.Title
 	sha := makeCommit(repo, result, []string{baseTip}, message)
 	repo.Refs["refs/heads/"+pull.BaseRef] = sha
+	repo.Rev.Add(1)
 	pull.State = "closed"
 	pull.Merged = true
 	pull.MergedAt = iso(tick())
@@ -714,7 +1128,7 @@ func restResolveCommit(repo *Repo, ref string) string {
 // ---------------------------------------------------------------- top-level dispatch
 
 // handleRest is the single entry point used by server.go.
-func handleRest(method string, segments []string, query url.Values, bodyText, host string) HTTPResult {
+func handleRest(method string, segments []string, query url.Values, bodyText, host string, scratch []byte) HTTPResult {
 	first := ""
 	if len(segments) > 0 {
 		first = segments[0]
@@ -782,7 +1196,7 @@ func handleRest(method string, segments []string, query url.Values, bodyText, ho
 	}
 
 	if first == "repos" && len(segments) >= 3 {
-		return restHandleRepo(method, segments, query, bodyText, host)
+		return restHandleRepo(method, segments, query, bodyText, host, scratch)
 	}
 
 	return restFail(404, "Not Found")
@@ -835,13 +1249,14 @@ func restCreateRepoRoute(bodyText, host string, _ url.Values) HTTPResult {
 	if v, present := parsed["default_branch"]; present {
 		if s, isString := v.(string); isString && s != "" {
 			repo.DefaultBranch = s
+			repo.Rev.Add(1)
 		}
 	}
 	extra := map[string]string{"location": "http://" + host + "/api/v3/repos/" + Viewer.Login + "/" + name}
 	return restReply(201, restRepoObj(repo), extra)
 }
 
-func restHandleRepo(method string, segments []string, query url.Values, bodyText, host string) HTTPResult {
+func restHandleRepo(method string, segments []string, query url.Values, bodyText, host string, scratch []byte) HTTPResult {
 	repo := findRepo(segments[1], segments[2])
 	if repo == nil || !strings.EqualFold(repo.Owner, Viewer.Login) {
 		return restFail(404, "Not Found")
@@ -866,6 +1281,7 @@ func restHandleRepo(method string, segments []string, query url.Values, bodyText
 					delete(GlobalStore.Repos, restRepoKey(repo.Owner, repo.Name))
 					repo.Name = s
 					GlobalStore.Repos[restRepoKey(repo.Owner, repo.Name)] = repo
+					invalidateRepoIssues(repo)
 				}
 			}
 			if v, present := parsed["private"]; present {
@@ -887,7 +1303,7 @@ func restHandleRepo(method string, segments []string, query url.Values, bodyText
 	case "labels":
 		return restHandleLabels(method, segments, bodyText, repo)
 	case "issues":
-		return restHandleIssues(method, segments, query, bodyText, host, repo)
+		return restHandleIssues(method, segments, query, bodyText, host, repo, scratch)
 	case "pulls":
 		return restHandlePulls(method, segments, query, bodyText, host, repo)
 	case "branches":
@@ -1091,6 +1507,7 @@ func restHandleGitDataDepth(method string, segments []string, bodyText string, r
 			return restFail(422, "Reference already exists")
 		}
 		repo.Refs[ref] = sha
+		repo.Rev.Add(1)
 		typ := "commit"
 		if obj, ok := repo.Objects[sha]; ok {
 			typ = obj.Type
@@ -1105,9 +1522,11 @@ func restHandleGitDataDepth(method string, segments []string, bodyText string, r
 				return restFail(422, "Reference does not exist")
 			}
 			delete(repo.Refs, ref)
+			repo.Rev.Add(1)
 			return restEmpty(204)
 		}
 		delete(repo.Refs, ref)
+		repo.Rev.Add(1)
 		if depth < 2 {
 			return restHandleGitDataDepth(method, segments, bodyText, repo, depth+1)
 		}
@@ -1145,13 +1564,37 @@ func restResolveLabels(repo *Repo, value any) ([]Label, string) {
 	return labels, ""
 }
 
-func restHandleIssues(method string, segments []string, query url.Values, bodyText, host string, repo *Repo) HTTPResult {
-	rest := restDecodeSegments(segments[4:])
+// cloneIssueTexts copies the title and body out of the reusable request buffer
+// with one allocation instead of two.
+func cloneIssueTexts(title, body string) (string, string) {
+	if title == "" && body == "" {
+		return "", ""
+	}
+	buf := make([]byte, len(title)+len(body))
+	copy(buf, title)
+	copy(buf[len(title):], body)
+	return bytesToString(buf[:len(title)]), bytesToString(buf[len(title):])
+}
+
+func restHandleIssues(method string, segments []string, query url.Values, bodyText, host string, repo *Repo, scratch []byte) HTTPResult {
+	// server.go already decoded every segment into a reusable fixed buffer.
+	rest := segments[4:]
 	if len(rest) == 0 {
 		if method == "GET" {
 			return restListIssues(query, host, repo)
 		}
 		if method == "POST" {
+			if title, issueBody, fast := restParseIssueCreateFast(bodyText); fast {
+				if strings.TrimSpace(title) == "" {
+					return restFail(422, "Validation Failed")
+				}
+				// title/body are views into the reusable connection buffer; copy
+				// them into one stable allocation before they outlive this request.
+				title, issueBody = cloneIssueTexts(title, issueBody)
+				issue := restCreateIssue(repo, title, issueBody, nil)
+				return HTTPResult{Status: 201, ContentType: JSONType, Scratch: true,
+					Prebuilt: issueCreatePrebuilt(scratch, issue, repo, host)}
+			}
 			parsed, ok := restParseBody(bodyText)
 			if !ok {
 				return restFail(400, "Problems parsing JSON")
@@ -1165,10 +1608,8 @@ func restHandleIssues(method string, segments []string, query url.Values, bodyTe
 				return restFail(422, "Validation Failed: "+errMessage)
 			}
 			issue := restCreateIssue(repo, title, restStr(parsed, "body", ""), labels)
-			extra := map[string]string{
-				"location": "http://" + host + "/api/v3/repos/" + repo.Owner + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
-			}
-			return restReplyText(201, restIssueJSONText(issue, repo), extra)
+			return HTTPResult{Status: 201, ContentType: JSONType, Scratch: true,
+				Prebuilt: issueCreatePrebuilt(scratch, issue, repo, host)}
 		}
 		return restFail(404, "Not Found")
 	}
@@ -1209,10 +1650,11 @@ func restHandleIssues(method string, segments []string, query url.Values, bodyTe
 
 	if len(rest) == 1 {
 		if method == "GET" {
-			text := restIssueString(issue, repo)
-			result := restReplyText(200, text, nil)
-			result.CacheKey = text
-			return result
+			return HTTPResult{
+				Status:      200,
+				ContentType: JSONType,
+				Prebuilt:    issuePrebuiltResponse(issue, repo),
+			}
 		}
 		if method == "PATCH" {
 			parsed, ok := restParseBody(bodyText)
@@ -1242,7 +1684,7 @@ func restHandleIssues(method string, segments []string, query url.Values, bodyTe
 				issue.Labels = labels
 			}
 			issue.UpdatedAt = iso(tick())
-			issue.Cache = ""
+			invalidateIssue(issue)
 			return restReplyText(200, restIssueJSONText(issue, repo), nil)
 		}
 	}
@@ -1593,6 +2035,7 @@ func restHandleContents(method string, segments []string, query url.Values, body
 		}
 		commit := makeCommit(repo, files, parents, message)
 		repo.Refs[branchRef] = commit
+		repo.Rev.Add(1)
 		repo.UpdatedAt = iso(tick())
 		status := 201
 		if hadBefore {
@@ -1651,6 +2094,7 @@ func restHandleContents(method string, segments []string, query url.Values, body
 		}
 		commit := makeCommit(repo, files, parents, message)
 		repo.Refs[branchRef] = commit
+		repo.Rev.Add(1)
 		return restReply(200, restObj(
 			"content", nil,
 			"commit", restCommitJSON(commit, message),

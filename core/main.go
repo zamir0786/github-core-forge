@@ -59,7 +59,9 @@ func waitForDone(client *http.Client, base string) {
 			body, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if readErr == nil && resp.StatusCode == 200 {
-				var v struct{ Done bool `json:"done"` }
+				var v struct {
+					Done bool `json:"done"`
+				}
 				if json.Unmarshal(body, &v) == nil && v.Done {
 					return
 				}

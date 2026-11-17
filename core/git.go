@@ -13,7 +13,6 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -31,15 +30,33 @@ const (
 
 // ---------------------------------------------------------------- deterministic response cache
 
-type gitCacheEntry struct {
-	sig  string
-	body []byte
+// gitRendered is a copy-on-write snapshot published atomically per repository.
+// All cached byte slices are immutable once published, so readers never take a
+// lock and never rebuild a response after warmup. A repo revision bump retires
+// the whole snapshot without touching the old bytes in flight.
+type gitRendered struct {
+	rev   uint64
+	cache sync.Map // request key -> *gitInflight
 }
 
-var (
-	gitCacheMu sync.Mutex
-	gitCache   = make(map[*Repo]map[string]gitCacheEntry)
-)
+type gitCachedBody struct {
+	body     []byte
+	key      string
+	prebuilt []byte
+}
+
+// gitInflight gives every cache key single-flight semantics. The first clone
+// renders a pack; the other clones wait on the same sync.Once instead of
+// duplicating expensive planning and pack hashing work.
+type gitInflight struct {
+	once   sync.Once
+	result *gitCachedBody
+}
+
+func (g *gitInflight) get() *gitCachedBody {
+	g.once.Do(func() {})
+	return g.result
+}
 
 type gitNamedOID struct {
 	name string
@@ -67,23 +84,46 @@ func gitRefSig(repo *Repo) string {
 	return b.String()
 }
 
-/** Memoize one deterministic response until the repo's refs change. */
-func gitCached(repo *Repo, key string, makeBody func() []byte) []byte {
-	sig := gitRefSig(repo)
-	fullKey := sig + "\x00" + key
-	gitCacheMu.Lock()
-	defer gitCacheMu.Unlock()
-	byKey := gitCache[repo]
-	if byKey == nil {
-		byKey = make(map[string]gitCacheEntry)
-		gitCache[repo] = byKey
+/** Memoize one deterministic response until the repo's revision changes. */
+func gitCached(repo *Repo, key, contentType string, headers map[string]string, makeBody func() []byte) *gitCachedBody {
+	rev := repo.Rev.Load()
+	snapshot := repo.Rendered.Load()
+	if snapshot == nil || snapshot.rev != rev {
+		next := &gitRendered{rev: rev}
+		for {
+			current := repo.Rendered.Load()
+			if current != nil && current.rev == rev {
+				snapshot = current
+				break
+			}
+			if repo.Rendered.CompareAndSwap(current, next) {
+				snapshot = next
+				break
+			}
+		}
 	}
-	if hit, ok := byKey[fullKey]; ok && hit.sig == sig {
-		return hit.body
+	fullKey := key
+	if hit, ok := snapshot.cache.Load(fullKey); ok {
+		return hit.(*gitInflight).get()
 	}
-	body := makeBody()
-	byKey[fullKey] = gitCacheEntry{sig: sig, body: body}
-	return body
+	flight := &gitInflight{}
+	actual, loaded := snapshot.cache.LoadOrStore(fullKey, flight)
+	if !loaded {
+		flight.once.Do(func() {
+			body := makeBody()
+			flight.result = &gitCachedBody{
+				body: body,
+				key:  "git:" + sha1Hex(body),
+				prebuilt: buildResponse(nil, HTTPResult{
+					Status:      200,
+					ContentType: contentType,
+					Body:        body,
+					Headers:     headers,
+				}, false),
+			}
+		})
+	}
+	return actual.(*gitInflight).get()
 }
 
 // ---------------------------------------------------------------- small wire helpers
@@ -113,6 +153,19 @@ func gitSideband(data []byte) []byte {
 	}
 	return b.bytes()
 }
+
+var gitV2UploadAd = func() []byte {
+	var out gitPktBuilder
+	out.line("# service=git-upload-pack\n")
+	out.flush()
+	out.line("version 2\n")
+	out.line("agent=" + gitAgent + "\n")
+	out.line("ls-refs=unborn\n")
+	out.line("fetch=shallow\n")
+	out.line("object-format=sha1\n")
+	out.flush()
+	return out.bytes()
+}()
 
 func gitTextResult(status int, text string) HTTPResult {
 	return HTTPResult{Status: status, ContentType: "text/plain; charset=utf-8", Body: []byte(text)}
@@ -253,10 +306,30 @@ func gitIsAncestor(repo *Repo, ancestor string, descendant string) bool {
 }
 
 func gitHashObject(typ string, data []byte) string {
-	header := []byte(fmt.Sprintf("%s %d\x00", typ, len(data)))
-	full := make([]byte, 0, len(header)+len(data))
-	full = append(full, header...)
-	full = append(full, data...)
+	var header [32]byte
+	n := copy(header[:], typ)
+	header[n] = ' '
+	n++
+	prefix := strconv.AppendInt(header[:n], int64(len(data)), 10)
+	n = len(prefix)
+	header[n] = 0
+	n++
+
+	// Push and clone objects are small; hashing them through a stack buffer
+	// avoids the temporary "header + object" heap allocation on every object.
+	if n+len(data) <= 4096 {
+		var full [4096]byte
+		copy(full[:], header[:n])
+		copy(full[n:], data)
+		sum := sha1.Sum(full[:n+len(data)])
+		var encoded [40]byte
+		hex.Encode(encoded[:], sum[:])
+		return string(encoded[:])
+	}
+
+	full := make([]byte, n+len(data))
+	copy(full, header[:n])
+	copy(full[n:], data)
 	sum := sha1.Sum(full)
 	return hex.EncodeToString(sum[:])
 }
@@ -266,10 +339,19 @@ func gitPutObject(repo *Repo, typ string, data []byte) string {
 		repo.Objects = make(map[string]GitObject)
 	}
 	oid := gitHashObject(typ, data)
+	gitPutObjectOID(repo, oid, typ, data)
+	return oid
+}
+
+// gitPutObjectOID avoids recomputing the OID that gitReadPack already derived.
+func gitPutObjectOID(repo *Repo, oid, typ string, data []byte) {
+	if repo.Objects == nil {
+		repo.Objects = make(map[string]GitObject)
+	}
 	if _, exists := repo.Objects[oid]; !exists {
 		repo.Objects[oid] = GitObject{Type: typ, Data: data}
+		repo.Rev.Add(1)
 	}
-	return oid
 }
 
 // ---------------------------------------------------------------- packfile writing / reading
@@ -297,21 +379,56 @@ func gitPackObjectHeader(typ string, size int) []byte {
 	return bytesOut
 }
 
+type gitPackChunk struct {
+	header     []byte
+	compressed []byte
+}
+
+// Content-addressed compressed chunks: objects are immutable once inserted, so
+// a chunk rendered on the first fetch can be reused by every later pack with
+// no zlib work. This is the zero-zlib path for warm clones.
+var gitPackChunks sync.Map // oid -> gitPackChunk
+
+func gitPackObjectChunk(oid string, object GitObject) gitPackChunk {
+	if oid != "" {
+		if hit, ok := gitPackChunks.Load(oid); ok {
+			return hit.(gitPackChunk)
+		}
+	} else {
+		oid = gitHashObject(object.Type, object.Data)
+		if hit, ok := gitPackChunks.Load(oid); ok {
+			return hit.(gitPackChunk)
+		}
+	}
+	chunk := gitPackChunk{
+		header:     gitPackObjectHeader(object.Type, len(object.Data)),
+		compressed: nil,
+	}
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, _ = zw.Write(object.Data)
+	_ = zw.Close()
+	chunk.compressed = append([]byte(nil), compressed.Bytes()...)
+	actual, _ := gitPackChunks.LoadOrStore(oid, chunk)
+	return actual.(gitPackChunk)
+}
+
 /** Version-2 packfile of plain objects with a SHA-1 trailer, as objects.ts writePack does. */
-func gitWritePack(objects []GitObject) []byte {
+func gitWritePack(objects []GitObject, oids []string) []byte {
 	header := make([]byte, 12)
 	copy(header, "PACK")
 	binary.BigEndian.PutUint32(header[4:], 2)
 	binary.BigEndian.PutUint32(header[8:], uint32(len(objects)))
 	body := make([]byte, 0, 256)
 	body = append(body, header...)
-	for _, object := range objects {
-		body = append(body, gitPackObjectHeader(object.Type, len(object.Data))...)
-		var compressed bytes.Buffer
-		zw := zlib.NewWriter(&compressed)
-		_, _ = zw.Write(object.Data)
-		_ = zw.Close()
-		body = append(body, compressed.Bytes()...)
+	for i, object := range objects {
+		oid := ""
+		if i < len(oids) {
+			oid = oids[i]
+		}
+		chunk := gitPackObjectChunk(oid, object)
+		body = append(body, chunk.header...)
+		body = append(body, chunk.compressed...)
 	}
 	sum := sha1.Sum(body)
 	out := make([]byte, 0, len(body)+20)
@@ -458,11 +575,12 @@ func gitApplyDelta(base []byte, delta []byte) []byte {
 	return out[:written]
 }
 
-/** Read the objects in a version-2 packfile. Returns the same count semantics as objects.ts. */
-func gitReadPack(pack []byte) ([]GitObject, int) {
+/** Read the objects in a version-2 packfile. Returns objects and their OIDs. */
+func gitReadPack(pack []byte) ([]GitObject, []string, int) {
 	objects := make([]GitObject, 0)
+	oids := make([]string, 0)
 	if len(pack) < 32 || string(pack[:4]) != "PACK" {
-		return objects, 0
+		return objects, oids, 0
 	}
 	declaredCount := int(binary.BigEndian.Uint32(pack[8:12]))
 	body := pack[:len(pack)-20]
@@ -471,33 +589,27 @@ func gitReadPack(pack []byte) ([]GitObject, int) {
 	count := 0
 	for off := 12; off < len(body) && count < declaredCount; {
 		start := off
-		if off >= len(body) {
-			break
-		}
 		b := body[off]
 		off++
 		code := (b >> 4) & 0x07
-		_ = b & 0x0f // declared size; not needed for plain objects
-		shift := uint(4)
 		for b&0x80 != 0 {
 			if off >= len(body) {
-				return objects, declaredCount
+				return objects, oids, declaredCount
 			}
 			b = body[off]
 			off++
-			shift += 7
 		}
 		var base GitObject
 		if code == 6 {
 			if off >= len(body) {
-				return objects, declaredCount
+				return objects, oids, declaredCount
 			}
 			b2 := body[off]
 			off++
 			value := int(b2 & 0x7f)
 			for b2&0x80 != 0 {
 				if off >= len(body) {
-					return objects, declaredCount
+					return objects, oids, declaredCount
 				}
 				b2 = body[off]
 				off++
@@ -506,14 +618,17 @@ func gitReadPack(pack []byte) ([]GitObject, int) {
 			base = byOffset[start-value]
 		} else if code == 7 {
 			if off+20 > len(body) {
-				return objects, declaredCount
+				return objects, oids, declaredCount
 			}
 			baseOID := hex.EncodeToString(body[off : off+20])
 			off += 20
 			base = byOID[baseOID]
 		}
-		cr := &gitCountingReader{r: bytes.NewReader(body[off:])}
-		zr, err := zlib.NewReader(cr)
+		// bytes.Reader.Len gives the exact compressed byte count without
+		// forcing flate through a one-byte-at-a-time counting reader.
+		chunkLen := len(body) - off
+		source := bytes.NewReader(body[off:])
+		zr, err := zlib.NewReader(source)
 		if err != nil {
 			break
 		}
@@ -522,7 +637,7 @@ func gitReadPack(pack []byte) ([]GitObject, int) {
 		if err != nil {
 			break
 		}
-		off += cr.n
+		off += chunkLen - source.Len()
 		var typ string
 		var data []byte
 		if code == 6 || code == 7 {
@@ -549,12 +664,15 @@ func gitReadPack(pack []byte) ([]GitObject, int) {
 		byOID[oid] = object
 		byOffset[start] = object
 		objects = append(objects, object)
+		oids = append(oids, oid)
 		count++
 	}
-	return objects, declaredCount
+	return objects, oids, declaredCount
 }
 
 // ---------------------------------------------------------------- info/refs advertisements
+
+var gitNoCacheHeaders = map[string]string{"cache-control": "no-cache"}
 
 /** `GET /<owner>/<repo>.git/info/refs?service=...`. */
 func handleInfoRefs(repo *Repo, service string, gitProtocol string) HTTPResult {
@@ -564,20 +682,18 @@ func handleInfoRefs(repo *Repo, service string, gitProtocol string) HTTPResult {
 	if isUpload {
 		contentType = gitUploadType
 	}
-	cacheKey := fmt.Sprintf("ad:%t:%t", isUpload, v2)
-	body := gitCached(repo, cacheKey, func() []byte {
-		var out gitPktBuilder
-		if isUpload && v2 {
-			out.line("# service=git-upload-pack\n")
-			out.flush()
-			out.line("version 2\n")
-			out.line("agent=" + gitAgent + "\n")
-			out.line("ls-refs=unborn\n")
-			out.line("fetch=shallow\n")
-			out.line("object-format=sha1\n")
-			out.flush()
-			return out.bytes()
+	if isUpload && v2 {
+		return HTTPResult{
+			Status: 200, ContentType: contentType, Body: gitV2UploadAd,
+			Headers: gitNoCacheHeaders, CacheKey: "git:v2-upload-ad",
 		}
+	}
+	cacheKey := "ad:upload:v0"
+	if !isUpload {
+		cacheKey = "ad:receive:v0"
+	}
+	cached := gitCached(repo, cacheKey, contentType, gitNoCacheHeaders, func() []byte {
+		var out gitPktBuilder
 		tip, hasTip := gitHeadOID(repo)
 		if isUpload {
 			caps := "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/" +
@@ -616,9 +732,10 @@ func handleInfoRefs(repo *Repo, service string, gitProtocol string) HTTPResult {
 	return HTTPResult{
 		Status:      200,
 		ContentType: contentType,
-		Body:        body,
-		Headers:     map[string]string{"cache-control": "no-cache"},
-		CacheKey:    "git:" + sha1Hex(body),
+		Body:        cached.body,
+		Headers:     gitNoCacheHeaders,
+		CacheKey:    cached.key,
+		Prebuilt:    cached.prebuilt,
 	}
 }
 
@@ -640,7 +757,7 @@ func gitPacketLines(body []byte) []string {
 }
 
 /** `POST /<owner>/<repo>.git/git-upload-pack`. */
-func handleUploadPack(repo *Repo, body []byte, gitProtocol string) HTTPResult {
+func handleUploadPack(repo *Repo, body []byte) HTTPResult {
 	lines := gitPacketLines(body)
 	first := ""
 	if len(lines) > 0 {
@@ -687,7 +804,7 @@ func gitHandleLSRefs(repo *Repo, lines []string) HTTPResult {
 		}
 		return false
 	}
-	out := gitCached(repo, "ls:"+strings.Join(lines, "\x00"), func() []byte {
+	cached := gitCached(repo, "ls:"+strings.Join(lines, "\x00"), gitUploadResult, nil, func() []byte {
 		var parts gitPktBuilder
 		tip, hasTip := gitHeadOID(repo)
 		if keep("HEAD") {
@@ -722,7 +839,7 @@ func gitHandleLSRefs(repo *Repo, lines []string) HTTPResult {
 		parts.flush()
 		return parts.bytes()
 	})
-	return HTTPResult{Status: 200, ContentType: gitUploadResult, Body: out, CacheKey: "git:" + sha1Hex(out)}
+	return HTTPResult{Status: 200, ContentType: gitUploadResult, Body: cached.body, CacheKey: cached.key, Prebuilt: cached.prebuilt}
 }
 
 type gitFetchPlan struct {
@@ -898,13 +1015,15 @@ func gitHandleFetch(repo *Repo, lines []string) HTTPResult {
 			}
 		}
 	}
-	out := gitCached(repo, "fetch:"+strings.Join(lines, "\x00"), func() []byte {
+	cached := gitCached(repo, "fetch:"+strings.Join(lines, "\x00"), gitUploadResult, nil, func() []byte {
 		plan := gitPlanFetch(repo, wants, haves, depth, clientShallow)
 		objects := make([]GitObject, 0, len(plan.order))
+		oids := make([]string, 0, len(plan.order))
 		for _, oid := range plan.order {
 			objects = append(objects, plan.objects[oid])
+			oids = append(oids, oid)
 		}
-		pack := gitWritePack(objects)
+		pack := gitWritePack(objects, oids)
 		var chunks gitPktBuilder
 		if len(wants) > 0 {
 			chunks.line("acknowledgments\n")
@@ -930,7 +1049,7 @@ func gitHandleFetch(repo *Repo, lines []string) HTTPResult {
 		}
 		return chunks.bytes()
 	})
-	return HTTPResult{Status: 200, ContentType: gitUploadResult, Body: out, CacheKey: "git:" + sha1Hex(out)}
+	return HTTPResult{Status: 200, ContentType: gitUploadResult, Body: cached.body, CacheKey: cached.key, Prebuilt: cached.prebuilt}
 }
 
 // ---------------------------------------------------------------- receive-pack
@@ -999,12 +1118,12 @@ func handleReceivePack(repo *Repo, body []byte) HTTPResult {
 	unpackOK := true
 	if len(pack) > 0 {
 		if len(pack) >= 12 && string(pack[:4]) == "PACK" {
-			objects, declared := gitReadPack(pack)
+			objects, oids, declared := gitReadPack(pack)
 			if len(objects) != declared {
 				unpackOK = false
 			}
-			for _, object := range objects {
-				gitPutObject(repo, object.Type, object.Data)
+			for i, object := range objects {
+				gitPutObjectOID(repo, oids[i], object.Type, object.Data)
 			}
 		} else {
 			unpackOK = false
@@ -1046,6 +1165,7 @@ func handleReceivePack(repo *Repo, body []byte) HTTPResult {
 		}
 	}
 	repo.UpdatedAt = isoNow()
+	repo.Rev.Add(1)
 
 	var inner gitPktBuilder
 	if unpackOK {

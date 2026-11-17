@@ -44,8 +44,31 @@ func repoKey(owner, name string) string {
 	return strings.ToLower(owner) + "/" + strings.ToLower(name)
 }
 
+func appendLowerASCII(dst []byte, s string) ([]byte, bool) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		} else if c >= 0x80 {
+			return dst, false
+		}
+		dst = append(dst, c)
+	}
+	return dst, true
+}
+
 func findRepo(owner, name string) *Repo {
 	ensureForgeStore()
+	var buf [160]byte
+	key, ok := appendLowerASCII(buf[:0], owner)
+	if ok {
+		key = append(key, '/')
+		key, ok = appendLowerASCII(key, name)
+	}
+	if ok {
+		// The compiler keeps this conversion allocation-free for map lookups.
+		return GlobalStore.Repos[string(key)]
+	}
 	return GlobalStore.Repos[repoKey(owner, name)]
 }
 
@@ -144,6 +167,7 @@ func putObject(repo *Repo, typ string, data []byte) string {
 	oid := hashObject(typ, data)
 	if _, exists := repo.Objects[oid]; !exists {
 		repo.Objects[oid] = GitObject{Type: typ, Data: data}
+		repo.Rev.Add(1)
 	}
 	return oid
 }
@@ -533,7 +557,7 @@ func addComment(repo *Repo, issue *Issue, body string) Comment {
 	repo.Comments[issue.ID] = list
 	issue.Comments = len(list)
 	issue.UpdatedAt = now
-	issue.Cache = ""
+	invalidateIssue(issue)
 	return comment
 }
 
@@ -726,6 +750,7 @@ func mergePull(repo *Repo, p *Pull) (bool, int, string, string) {
 	}
 	sha := makeCommit(repo, result, []string{baseTip}, fmt.Sprintf("Merge pull request #%d from %s\n\n%s", p.Number, p.HeadRef, p.Title))
 	repo.Refs["refs/heads/"+p.BaseRef] = sha
+	repo.Rev.Add(1)
 	p.State = "closed"
 	p.Merged = true
 	p.MergedAt = iso(tick())

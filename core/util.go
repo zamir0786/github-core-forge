@@ -2,10 +2,10 @@ package main
 
 import (
 	"crypto/sha1"
-	"encoding/json"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -129,7 +129,11 @@ func packetsOf(buf []byte) [][]byte {
 
 const epochMS int64 = 1766000000000
 
-func nowMS() int64 {
+// The trial clock is fixed for the whole process. Parsing the environment on
+// every tick() made issue creation and git mutation needlessly expensive.
+var trialNowMS = parseTrialNowMS()
+
+func parseTrialNowMS() int64 {
 	raw := os.Getenv("MAKEFUN_TRIAL_NOW")
 	if raw != "" {
 		if t, err := time.Parse(time.RFC3339, raw); err == nil {
@@ -145,13 +149,16 @@ func nowMS() int64 {
 	return epochMS
 }
 
+func nowMS() int64 { return trialNowMS }
+
 func tick() int64 {
 	GlobalStore.ClockTick++
 	return nowMS() + int64(GlobalStore.ClockTick)*1000
 }
 
 func iso(ms int64) string {
-	return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05Z")
+	var buf [20]byte
+	return string(time.UnixMilli(ms).UTC().AppendFormat(buf[:0], "2006-01-02T15:04:05Z"))
 }
 
 func isoNow() string { return iso(tick()) }

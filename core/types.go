@@ -3,6 +3,8 @@ package main
 // Shared data model. This mirrors bot/store.ts and bot/objects.ts exactly so each
 // surface (git, REST, GraphQL, MCP) reads and writes one deterministic in-memory store.
 
+import "sync/atomic"
+
 type User struct {
 	ID    int
 	Login string
@@ -29,6 +31,10 @@ type Issue struct {
 	UpdatedAt string
 	Comments  int
 	Cache     string
+	// Full is the complete serialized HTTP response (status line + headers +
+	// body) and is invalidated by Store(nil) on every mutation. It is immutable
+	// after creation.
+	Full atomic.Pointer[[]byte]
 }
 
 type Comment struct {
@@ -40,21 +46,21 @@ type Comment struct {
 }
 
 type Pull struct {
-	ID              int
-	Number          int
-	Title           string
-	Body            string
-	State           string
-	Merged          bool
-	MergedAt        string
-	MergeCommitSha  string
-	HeadRef         string
-	BaseRef         string
-	HeadSha         string
-	BaseSha         string
-	CreatedAt       string
-	UpdatedAt       string
-	User            User
+	ID             int
+	Number         int
+	Title          string
+	Body           string
+	State          string
+	Merged         bool
+	MergedAt       string
+	MergeCommitSha string
+	HeadRef        string
+	BaseRef        string
+	HeadSha        string
+	BaseSha        string
+	CreatedAt      string
+	UpdatedAt      string
+	User           User
 }
 
 type TreeEntry struct {
@@ -111,11 +117,11 @@ type PackReadResult struct {
 }
 
 type DiffFile struct {
-	Filename string
-	Status   string
+	Filename  string
+	Status    string
 	Additions int
 	Deletions int
-	Patch    string
+	Patch     string
 }
 
 type Repo struct {
@@ -135,17 +141,21 @@ type Repo struct {
 	Pulls         []*Pull
 	PullSeq       int
 	Comments      map[int][]Comment
+	// Rev is bumped whenever refs or objects change. Git responses are cached
+	// per (repo, rev, request) and published through atomic pointers.
+	Rev      atomic.Uint64
+	Rendered atomic.Pointer[gitRendered]
 }
 
 type Store struct {
-	Repos       map[string]*Repo
-	CommentSeq  int
-	RepoSeq     int
-	IssueIDSeq  int
-	PullIDSeq   int
-	LabelSeq    int
-	RequestSeq  int
-	ClockTick   int
+	Repos      map[string]*Repo
+	CommentSeq int
+	RepoSeq    int
+	IssueIDSeq int
+	PullIDSeq  int
+	LabelSeq   int
+	RequestSeq int
+	ClockTick  int
 }
 
 // GlobalStore is the single deterministic in-memory forge shared by every surface.
@@ -165,6 +175,12 @@ type HTTPResult struct {
 	Body        []byte
 	Headers     map[string]string
 	CacheKey    string // when set, server.go caches the complete HTTP response bytes
+	// Prebuilt is a complete serialized HTTP response. When set, serveConn writes
+	// these bytes directly with no header building and no copying.
+	Prebuilt []byte
+	// Scratch marks Prebuilt as backed by the connection's reusable response
+	// buffer. serveConn adopts any growth after the Write completes.
+	Scratch bool
 }
 
 const ZeroOID = "0000000000000000000000000000000000000000"

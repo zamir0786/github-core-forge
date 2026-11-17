@@ -1160,7 +1160,7 @@ func gqlResolveMutation(field string, args map[string]interface{}) interface{} {
 		}
 		issue.State = "closed"
 		issue.UpdatedAt = iso(tick())
-		issue.Cache = ""
+		invalidateIssue(issue)
 		return gqlWrap("CloseIssuePayload", &gqlIssueRef{Repo: repo, Issue: issue})
 	}
 	if field == "createPullRequest" {
