@@ -350,9 +350,23 @@ export function issueJson(issue: Issue, repo: Repo): Record<string, unknown> {
   };
 }
 
+/** Serialize an issue directly to its REST shape; avoids the object + stringify round trip. */
+export function issueJsonText(issue: Issue, repo: Repo): string {
+  const q = JSON.stringify;
+  let labels = '[';
+  for (let i = 0; i < issue.labels.length; i += 1) {
+    const label = issue.labels[i] as Label;
+    if (i > 0) labels += ',';
+    labels += `{"id":${label.id},"name":${q(label.name)},"color":${q(label.color)},"description":${q(label.description)},"default":false}`;
+  }
+  labels += ']';
+  const closed = issue.state === 'closed';
+  return `{"id":${issue.id},"node_id":${q(`I_${issue.id}`)},"number":${issue.number},"title":${q(issue.title)},"body":${q(issue.body)},"state":${q(issue.state)},"state_reason":${closed ? '"completed"' : 'null'},"locked":false,"labels":${labels},"user":{"login":${q(VIEWER.login)},"id":${VIEWER.id},"type":"User"},"comments":${issue.comments},"created_at":${q(issue.created_at)},"updated_at":${q(issue.updated_at)},"closed_at":${closed ? q(issue.updated_at) : 'null'},"html_url":${q(`http://localhost/${repo.owner}/${repo.name}/issues/${issue.number}`)},"url":${q(`/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`)},"repository_url":${q(`/api/v3/repos/${repo.owner}/${repo.name}`)}}`;
+}
+
 export function issueString(issue: Issue, repo: Repo): string {
   if (issue.cache !== undefined) return issue.cache;
-  issue.cache = `${JSON.stringify(issueJson(issue, repo))}\n`;
+  issue.cache = `${issueJsonText(issue, repo)}\n`;
   return issue.cache;
 }
 

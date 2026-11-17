@@ -16,6 +16,7 @@ import {
   filesAtCommit,
   findRepo,
   issueJson,
+  issueJsonText,
   issueString,
   labelJson,
   makeCommit,
@@ -30,7 +31,7 @@ import {
   type Pull,
   type Repo,
 } from './store.ts';
-import { iso, JSON_TYPE, safeDecode, sendJson, tick } from './util.ts';
+import { iso, JSON_TYPE, safeDecode, sendJson, sendText, tick } from './util.ts';
 
 export interface RestContext {
   method: string;
@@ -473,7 +474,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, context: RestCo
         return true;
       }
       const issue = createIssue(repo, title, str(parsed.value.body), labels);
-      sendJson(res, 201, issueJson(issue, repo), {
+      sendText(res, 201, `${issueJsonText(issue, repo)}\n`, JSON_TYPE, {
         ...headers(),
         location: `http://${context.host}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
       });
@@ -534,7 +535,7 @@ function handleIssues(req: IncomingMessage, res: ServerResponse, context: RestCo
       }
       issue.updated_at = iso(tick());
       issue.cache = undefined;
-      sendJson(res, 200, issueJson(issue, repo), headers());
+      sendText(res, 200, `${issueJsonText(issue, repo)}\n`, JSON_TYPE, headers());
       return true;
     }
   }
