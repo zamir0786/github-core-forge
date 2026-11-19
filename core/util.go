@@ -50,10 +50,27 @@ func fromB64URL(text string) string {
 	return string(b)
 }
 
+const gitHexLower = "0123456789abcdef"
+
+func gitHexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
 func pkt(payload []byte) []byte {
 	out := make([]byte, 4+len(payload))
-	header := fmt.Sprintf("%04x", len(payload)+4)
-	copy(out, header)
+	n := len(payload) + 4
+	out[0] = gitHexLower[(n>>12)&0xf]
+	out[1] = gitHexLower[(n>>8)&0xf]
+	out[2] = gitHexLower[(n>>4)&0xf]
+	out[3] = gitHexLower[n&0xf]
 	copy(out[4:], payload)
 	return out
 }
@@ -95,12 +112,14 @@ func readPacket(buf []byte, offset int) Packet {
 	if offset+4 > len(buf) {
 		return Packet{Kind: "bad", Payload: []byte{}, Raw: buf[offset:], Next: len(buf)}
 	}
-	header := string(buf[offset : offset+4])
-	if !isHex4(header) {
+	h0, ok0 := gitHexNibble(buf[offset])
+	h1, ok1 := gitHexNibble(buf[offset+1])
+	h2, ok2 := gitHexNibble(buf[offset+2])
+	h3, ok3 := gitHexNibble(buf[offset+3])
+	if !ok0 || !ok1 || !ok2 || !ok3 {
 		return Packet{Kind: "bad", Payload: []byte{}, Raw: buf[offset : offset+4], Next: offset + 4}
 	}
-	n, _ := strconv.ParseInt(header, 16, 32)
-	length := int(n)
+	length := int(h0)<<12 | int(h1)<<8 | int(h2)<<4 | int(h3)
 	if length == 0 {
 		return Packet{Kind: "flush", Payload: []byte{}, Raw: buf[offset : offset+4], Next: offset + 4}
 	}
